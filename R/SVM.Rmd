@@ -1,0 +1,382 @@
+---
+title: "SVM - data_NBA"
+author: "JeanC"
+output:
+  word_document: default
+  html_document: default
+  pdf_document: default
+---
+
+## Librerias
+
+```{r}
+library(ggplot2)
+library(ggpubr)
+library(dplyr)
+library(psych)
+library(corrplot)
+library(RColorBrewer)
+library(funModeling)
+library(randomForest)
+library(purrr)
+library(tibble)
+library(doMC)
+library(caret)
+library(recipes)
+library(parsnip)
+library(dials)
+library(workflows)
+library(tune)
+library(rsample)
+library(yardstick)
+```
+
+## Cargar datos y tipos de variables
+
+```{r}
+data <- read.csv("D:/Descargas/nba_logreg2.csv", sep = ";")
+#Viendo la data
+head(data)
+
+#Verificando los tipos de datos de la data
+str(data)
+
+#Verificando valores de la data
+summary(data)
+
+#Cambiando nombres de encabezados
+colnames(data)[5] <-"FGM_"
+colnames(data)[7:10] <-c("FG","P3_Made","PA3","P3")
+colnames(data)[13] <-"FT"
+
+#Cambiando el tipo de variable a la variable target
+data$TARGET_5Yrs <- if_else(data$TARGET_5Yrs == 1, "Si", "No")
+data$TARGET_5Yrs <- as.factor(data$TARGET_5Yrs)
+
+#Viendo la data
+head(data)
+```
+
+## Visualizando datos NA por columna
+
+```{r}
+#Mediante valores por columna
+apply(X = is.na(data), MARGIN = 2, FUN = sum)  
+#Observamos que no encontramos valores NA
+```
+
+## Hallando y eliminando los duplicados
+
+```{r}
+#Hallando los duplicados
+data %>% group_by(Name) %>% filter(duplicated(Name))
+#Eliminando los duplicados
+data <- data %>% group_by(Name) %>% filter(!duplicated(Name))
+#Volviendo a desagrupar
+data <- data %>% ungroup()
+```
+
+## Distribución de variables respuesta
+
+```{r}
+
+ggplot(data = data, aes(x = TARGET_5Yrs, y = after_stat(count), fill = TARGET_5Yrs)) +
+  geom_bar() +
+  scale_fill_manual(values = c("gray50", "orangered2")) +
+  labs(title = "Mas de 5 años de carrera jugando") +
+  theme_bw() +
+  theme(legend.position = "bottom")
+
+# Tabla de frecuencias 
+table(data$TARGET_5Yrs)
+
+#Porcentaje
+prop.table(table(data$TARGET_5Yrs)) %>% round(digits = 2)
+```
+
+## Mapa de correlaciones
+
+```{r}
+#Creando una data con solo columnas numericas
+data_numeric <- data %>% ungroup() %>% select(-Name)
+data_numeric$TARGET_5Yrs <- if_else(data_numeric$TARGET_5Yrs == "Si", 1, 0)
+data_numeric$TARGET_5Yrs <- as.integer(data_numeric$TARGET_5Yrs)
+head(data_numeric)
+
+#Mapa de correlaciones por forma y color
+corrplot(cor(data_numeric), 
+         method="circle",
+         col=brewer.pal(n=9, name="PuBu"),
+         type="lower", 
+         tl.col="red",
+         tl.cex = 0.9, 
+         tl.srt=90, 
+         diag=FALSE, 
+         is.corr = F)
+
+#Mapa de correlaciones por valor y color
+corrplot(cor(data_numeric), 
+         method="color",
+         type="lower", 
+         number.cex=0.4,
+         addCoef.col = "black", 
+         tl.col="red", 
+         tl.srt=90, 
+         tl.cex = 0.9,
+         diag=FALSE, 
+         is.corr = F)
+
+```
+
+## Análisis de outliers
+
+```{r}
+#Bloxplot de los 10 primeros atributos
+boxplot(data_numeric %>% select(c(1:10)))
+#Bloxplot de los 9 últimos atributos
+boxplot(data_numeric %>% select(c(11:19)))
+
+#Observamos que los atributos GP y MIN no presentan valores atípicos
+```
+## Estandarizando las variables numéricas
+
+```{r}
+data_scale <- mutate_if(data, is.numeric, scale)
+```
+
+## Método de Selección
+
+### Random Forest
+
+```{r}
+datos_rf <- data_scale %>% select(-Name) %>%  
+            na.omit()
+datos_rf <- map_if(.x = datos_rf, .p = is.character, .f = as.factor) %>%
+            as.data.frame()
+modelo_randforest <- randomForest(formula = TARGET_5Yrs ~ . ,
+                                   data = na.omit(datos_rf),
+                                  mtry = 5,
+                                  importance = TRUE, 
+                                  ntree = 1000) 
+importancia <- as.data.frame(modelo_randforest$importance)
+importancia <- rownames_to_column(importancia,var = "variable")
+p1 <- ggplot(data = importancia, aes(x = reorder(variable, MeanDecreaseAccuracy),
+                               y = MeanDecreaseAccuracy,
+                               fill = MeanDecreaseAccuracy)) +
+      labs(x = "variable", title = "Reducción de Accuracy") +
+      geom_col() +
+      coord_flip() +
+      theme_bw() +
+      theme(legend.position = "bottom")
+p2 <- ggplot(data = importancia, aes(x = reorder(variable, MeanDecreaseGini),
+                               y = MeanDecreaseGini,
+                               fill = MeanDecreaseGini)) +
+      labs(x = "variable", title = "Reducción de pureza (Gini)") +
+      geom_col() +
+      coord_flip() +
+      theme_bw() +
+      theme(legend.position = "bottom")
+ggarrange(p1, p2)
+```
+
+## Análisis de outliers de la data escalada
+```{r}
+#Bloxplot de los 10 primeros atributos
+boxplot(data_scale %>% select(c(2:10)))
+#Bloxplot de los 9 últimos atributos
+boxplot(data_scale %>% select(c(11:20)))
+
+#Observamos que los atributos GP y MIN no presentan valores atípicos
+```
+## TRAIN--TEST
+```{r}
+set.seed(1234) # Semilla para aleatorios
+bco_split <- data %>%
+initial_split(prop = 0.8,
+strata = TARGET_5Yrs)
+train <- training(bco_split)
+dim(train)
+```
+
+```{r}
+test <- testing(bco_split)
+dim(test)
+```
+
+## DEFINICIÓN PARA TUNNING
+```{r}
+set.seed(1234)
+cv_banco <- vfold_cv(train, v =5, repeats = 1, strata = TARGET_5Yrs)
+cv_banco
+```
+
+## Así también definimos las métricas que queremos que se ejecuten en cada remuestreo
+```{r}
+metricas <- metric_set(roc_auc, accuracy, sens, spec, bal_accuracy)
+metricas
+```
+
+## SVM
+## RECIPE--Podemos probar nuestro recipe, con balanceo...rct_bcoPor: DATA ESTANDARIZADA
+```{r}
+rct_bcoPor <- train %>% recipe(TARGET_5Yrs ~ . ) %>%
+step_normalize( all_numeric(), -all_outcomes()) %>% # Normalizacion
+step_other(all_nominal(), -all_outcomes() ) %>% #todo los que sean menores a 5%, por default
+step_dummy(all_nominal(), -all_outcomes() ) %>% # Dummy
+step_corr(all_numeric(), -all_outcomes(), threshold = 0.9) %>%
+# Se elimina manualmente para poder agregar las interacciones
+step_nzv(all_predictors())   #nvz: columnas con poca variabilidad
+```
+
+#### Receta :rct_bcoPor: Data estandarizada
+#### Modelo
+```{r}
+svm_rbf_sp <- svm_rbf(                                      #svm_rbf: es radial, svm_poly: polinomial
+  cost= tune(), rbf_sigma= tune()     ) %>%  
+  set_engine("kernlab") %>%
+  set_mode("classification")
+
+svm_rbf_sp %>%
+  translate()
+```
+
+### Malla
+```{r}
+set.seed(123)
+
+svm_rbf_grid <- svm_rbf_sp %>%
+  hardhat::extract_parameter_set_dials()%>%
+  grid_latin_hypercube(size = 10)
+```
+
+```{r}
+svm_rbf_grid
+# cost: Mayor importancia , mejor modelo
+# sigma: de la fórmula del Kernel
+```
+
+### Definir workflow
+```{r}
+svm_rbf_wflow <-
+    workflow() %>%
+    add_recipe(rct_bcoPor) %>%  #numerica estandarizada
+    add_model(svm_rbf_sp)
+
+svm_rbf_wflow
+```
+### Paralelización
+```{r}
+library(doParallel)
+library(future)
+
+  parallel::detectCores(logical=FALSE)
+  cl <- makePSOCKcluster(4)
+  registerDoParallel(cl)
+# parallel::stopCluster(cl)
+```
+### Integracion de workflow, remuestreo, parámetros a probar y métricas.
+```{r}
+set.seed(123)
+
+svm_rbf_tuned <- tune_grid(
+  svm_rbf_wflow,
+  resamples= cv_banco,
+  grid = svm_rbf_grid,
+  metrics = metricas,
+  control= control_grid(allow_par = T, save_pred = T)
+)
+
+svm_rbf_tuned
+```
+
+### Mejores hiperparámetros
+```{r}
+show_best(svm_rbf_tuned, metric = 'accuracy', n = 4)
+```
+
+```{r}
+show_best(svm_rbf_tuned, metric = 'sens', n = 4)
+```
+
+```{r}
+show_best(svm_rbf_tuned, metric = 'bal_accuracy', n = 4)
+```
+
+### Se cierra el workflow con los valores tomados de arriba.
+```{r}
+svm_rbf_pars_fin <- select_best(svm_rbf_tuned, metric = 'bal_accuracy')
+
+svm_rbf_wflow_fin <-
+    svm_rbf_wflow %>%
+    finalize_workflow(svm_rbf_pars_fin)
+
+svm_fitted <- fit(svm_rbf_wflow_fin, train)
+svm_fitted
+```
+
+
+### ¿Dónde está el modelo? Podemos seleccionar el modelo así:
+```{r}
+svm_rbf_model_fin <- pull_workflow_fit(svm_fitted)
+svm_rbf_model_fin
+```
+
+### TEST----SVM
+```{r}
+test %>%
+  predict( svm_fitted, new_data = . ) %>%
+  mutate(Real= test$TARGET_5Yrs) %>%
+  conf_mat(truth = Real, estimate = .pred_class ) %>%
+  summary
+```
+
+#### Matriz de confusion----SVM
+```{r}
+test %>%
+  predict( svm_fitted, new_data = . ) %>%
+  mutate(Real= test$TARGET_5Yrs) %>%
+  conf_mat(truth = Real, estimate = .pred_class ) 
+```
+
+### AUC-TEST-SVM
+```{r}
+test%>%
+    predict( svm_fitted, new_data = . , type = "prob") %>%
+    mutate(Real= test$TARGET_5Yrs) ->  testprob_svm_bcoPor
+
+testprob_svm_bcoPor
+
+auc_test_svm <- roc_auc(  testprob_svm_bcoPor, Real, .pred_No )
+auc_test_svm = auc_test_svm  $.estimate
+auc_test_svm
+```
+
+### TRAIN----SVM--------------------------------------------------------------------
+```{r}
+train %>%
+    predict( svm_fitted, new_data = . ) %>%
+    mutate(Real= train$TARGET_5Yrs) %>%
+    conf_mat(truth = Real, estimate = .pred_class ) %>%
+    summary
+```
+
+### Matriz de confusion----SVM
+```{r}
+train %>%
+    predict( svm_fitted, new_data = . ) %>%
+    mutate(Real= train$TARGET_5Yrs) %>%
+    conf_mat(truth = Real, estimate = .pred_class )
+```
+
+### AUC-TRAIN-SVM
+```{r}
+train%>%
+  predict( svm_fitted, new_data = . , type = "prob") %>%
+  mutate(Real= train$TARGET_5Yrs) -> trainprob_svm_bcoPor
+
+trainprob_svm_bcoPor
+
+auc_train_svm <- roc_auc(  trainprob_svm_bcoPor, Real, .pred_No )
+auc_train_svm = auc_train_svm  $.estimate
+auc_train_svm
+```
